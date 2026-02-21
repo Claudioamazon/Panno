@@ -57,11 +57,11 @@ class DLHDExtractor:
 
         # ✅ Configurazione server dinamica dal worker (usando TEMPLATE completi)
         # Tutti i valori provengono dal worker, i fallback sono solo per il primo avvio
-        self.auth_url = cache_data.get('auth_url', 'https://security.kiko2.ru/auth2.php')
-        self.stream_cdn_template = cache_data.get('stream_cdn_template', 'https://top1.kiko2.ru/top1/cdn/{CHANNEL}/mono.css')
-        self.stream_other_template = cache_data.get('stream_other_template', 'https://{SERVER_KEY}new.kiko2.ru/{SERVER_KEY}/{CHANNEL}/mono.css')
-        self.server_lookup_url = cache_data.get('server_lookup_url', 'https://chevy.kiko2.ru/server_lookup')
-        self.base_domain = cache_data.get('base_domain', 'kiko2.ru')
+        self.auth_url = cache_data.get('auth_url')
+        self.stream_cdn_template = cache_data.get('stream_cdn_template')
+        self.stream_other_template = cache_data.get('stream_other_template')
+        self.server_lookup_url = cache_data.get('server_lookup_url')
+        self.base_domain = cache_data.get('base_domain')
         
         logger.info(f"Hosts loaded at startup: {self.iframe_hosts}")
         logger.info(f"Auth URL: {self.auth_url}")
@@ -186,9 +186,14 @@ class DLHDExtractor:
             headers['X-Secret-Key'] = secret_key
         return headers
 
-    async def _fetch_server_key(self, channel_key: str, iframe_url: str) -> str:
+    async def _fetch_server_key(self, channel_key: str, iframe_url: str, custom_lookup_url: str = None) -> str:
         """Fetch server key for a given channel."""
-        server_lookup_url = f"{self.server_lookup_url}?channel_id={channel_key}"
+        if custom_lookup_url:
+            server_lookup_url = custom_lookup_url
+        else:
+            server_lookup_url = f"{self.server_lookup_url}?channel_id={channel_key}"
+            
+        logger.info(f"🔎 Server lookup URL: {server_lookup_url}")
         iframe_origin = f"https://{urlparse(iframe_url).netloc}"
         lookup_headers = {
             'User-Agent': self.USER_AGENT,
@@ -236,7 +241,11 @@ class DLHDExtractor:
                             self.base_domain = line.replace('#BASE_DOMAIN:', '').strip()
                             logger.info(f"✅ Base Domain aggiornato: {self.base_domain}")
                         elif not line.startswith('#'):
-                            new_hosts.append(line)
+                             # Fix: se è un dominio "puro" (es. dlhd.link) non ha senso usarlo come iframe_url diretto se non supporta path.
+                             # Ma il worker ora manda anche URL completi.
+                             # Filtriamo linee vuote o non valide
+                            if len(line) > 3:
+                                new_hosts.append(line)
                     
                     if new_hosts:
                         self.iframe_hosts = new_hosts
@@ -390,8 +399,27 @@ class DLHDExtractor:
             last_error = None
             for iframe_host in hosts_to_try:
                 try:
-                    iframe_url = f'https://{iframe_host}/premiumtv/daddyhd.php?id={channel_id}'
-                    logger.info(f"🔍 Attempting extraction from: {iframe_url}")
+                    # Se iframe_url è un URL completo, non aggiungere altro
+                    if iframe_host.startswith('http'):
+                         iframe_url = iframe_host
+                         # Se l'URL contiene già un ID, non sovrascriverlo se non necessario,
+                         # ma qui channel_id viene dalla richiesta originale.
+                         # Caso speciale: se l'host nel worker è generico, potremmo doverlo adattare.
+                         # Ma per ora assumiamo che il worker mandi URL specifici o domini base.
+                    elif iframe_host.startswith('/'):
+                         continue
+                    else:
+                         iframe_url = f'https://{iframe_host}/premiumtv/daddyhd.php?id={channel_id}'
+                         
+                    # Se stiamo processando un URL specifico dal worker per un canale specifico,
+                    # e channel_id è diverso, potrebbe esserci un mismatch.
+                    # Ma generalmente l'utente chiede channel X e noi proviamo gli host.
+                    
+                    # Fix: se l'URL del worker ha già un ID (es id=877) ma noi cerchiamo un altro canale,
+                    # dobbiamo sostituire l'ID.
+                    if 'id=' in iframe_url and f'id={channel_id}' not in iframe_url:
+                        iframe_url = re.sub(r'id=\d+', f'id={channel_id}', iframe_url)
+                        logger.info(f"🔄 Adjusted iframe URL for channel {channel_id}: {iframe_url}")
                     
                     embed_headers = {
                         'User-Agent': self.USER_AGENT,
@@ -415,6 +443,7 @@ class DLHDExtractor:
                     
                     # Step 2: Extract auth params
                     params = {}
+                    server_lookup_url = None
                     patterns = {
                         'channel_key': r'(?:const|var|let)\s+(?:CHANNEL_KEY|channelKey)\s*=\s*["\']([^"\']+)["\']',
                         'auth_token': r'(?:const|var|let)\s+AUTH_TOKEN\s*=\s*["\']([^"\']+)["\']',
@@ -425,6 +454,11 @@ class DLHDExtractor:
                     for key, pattern in patterns.items():
                         match = re.search(pattern, js_content)
                         params[key] = match.group(1) if match else None
+                    
+                    # Try to extract server_lookup_url from standard flow
+                    lookup_match = re.search(r"fetchWithRetry\s*\(\s*'([^']+server_lookup\?channel_id=)", js_content)
+                    if lookup_match and params.get('channel_key'):
+                         server_lookup_url = lookup_match.group(1) + params['channel_key']
                     
                     missing_params = [k for k, v in params.items() if not v]
                     if missing_params:
@@ -444,7 +478,7 @@ class DLHDExtractor:
                     # ✅ DINAMICO: usa self.auth_url completo
                     auth_url = self.auth_url
                     logger.info(f"🔐 Using auth_url: {auth_url}")
-                    iframe_origin = f"https://{iframe_host}"
+                    iframe_origin = f"https://{urlparse(iframe_host).netloc}" if iframe_host.startswith('http') else f"https://{iframe_host}"
                     
                     form_data = FormData()
                     form_data.add_field('channelKey', params['channel_key'])
@@ -518,7 +552,7 @@ class DLHDExtractor:
                     logger.info(f"🍪 Tutti i cookies nella sessione dopo auth: {all_session_cookies}")
                     
                     # Step 4: Server Lookup
-                    server_key = await self._fetch_server_key(params['channel_key'], iframe_url)
+                    server_key = await self._fetch_server_key(params['channel_key'], iframe_url, custom_lookup_url=server_lookup_url)
                     logger.info(f"✅ Server key: {server_key}")
 
                     channel_key = params['channel_key']
@@ -925,6 +959,7 @@ class DLHDExtractor:
 
         params = {}
         secret_key = None
+        server_lookup_url = None
         data_found = False
 
         if eplayer_data:
@@ -932,6 +967,7 @@ class DLHDExtractor:
             params['auth_token'] = eplayer_data.get('auth_token')
             params['channel_key'] = eplayer_data.get('channel_key')
             secret_key = eplayer_data.get('channel_salt')
+            server_lookup_url = eplayer_data.get('server_lookup_url')
             data_found = True
             if secret_key:
                 logger.info(f"✅ Channel salt estratto per calcolo nonce")
@@ -944,6 +980,7 @@ class DLHDExtractor:
                 params['auth_token'] = obfuscated_data.get('session_token')
                 params['channel_key'] = obfuscated_data.get('channel_key')
                 secret_key = obfuscated_data.get('secret_key')
+                server_lookup_url = obfuscated_data.get('server_lookup_url')
                 data_found = True
                 if secret_key:
                     logger.info(f"✅ Secret key estratta per calcolo nonce")
@@ -1012,7 +1049,7 @@ class DLHDExtractor:
         auth_token = params['auth_token']
 
         # 3. Server Lookup - use helper method
-        server_key = await self._fetch_server_key(channel_key, iframe_url)
+        server_key = await self._fetch_server_key(channel_key, iframe_url, custom_lookup_url=server_lookup_url)
         logger.info(f"✅ Server key: {server_key}")
 
         # Build Stream URL - use helper method
