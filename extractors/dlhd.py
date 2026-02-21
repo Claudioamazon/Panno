@@ -66,6 +66,9 @@ class DLHDExtractor:
         self.base_domain = cache_data.get('base_domain')
         self.lovecdn_url = cache_data.get('lovecdn_url') # ✅ Cache lovecdn url
         
+        # Track failed LoveCDN attempts to implement retry logic
+        self._lovecdn_failure_time: Dict[str, float] = {} 
+        
         logger.info(f"Hosts loaded at startup: {self.iframe_hosts}")
         logger.info(f"Auth URL: {self.auth_url}")
         logger.info(f"Stream CDN Template: {self.stream_cdn_template}")
@@ -551,6 +554,16 @@ class DLHDExtractor:
                 if expires_at and current_time > (expires_at - 30):
                      logger.warning(f"⚠️ Cache expired for channel ID {channel_id} (expires_at: {expires_at}).")
                      is_valid = False
+                elif cached_data.get("_source") == "standard":
+                     # Check cooldown for LoveCDN retry
+                     last_fail = self._lovecdn_failure_time.get(channel_id, 0)
+                     if current_time - last_fail > 120: # 2 minutes cooldown
+                         logger.info(f"⏳ LoveCDN cooldown expired for {channel_id}. Ignoring standard cache to retry LoveCDN.")
+                         is_valid = False
+                     else:
+                         # Still in cooldown, use standard
+                         is_valid = True
+                         logger.info(f"⏳ Using cached standard stream (LoveCDN cooldown active for {int(120 - (current_time - last_fail))}s)")
                 else:
                     # ✅ Only validate with HEAD request if we're within 5 minutes of expiry
                     # This reduces unnecessary network requests for fresh cache entries
@@ -616,13 +629,44 @@ class DLHDExtractor:
                             if resp.status == 200:
                                 content = await resp.text()
                                 result = await self._extract_lovecdn_stream(lovecdn_url, content)
-                                self._stream_data_cache[channel_id] = result
-                                self._save_cache()
-                                return result
+                                
+                                # Validate stream URL
+                                stream_url = result.get("destination_url")
+                                stream_headers = result.get("request_headers", {})
+                                
+                                logger.info(f"🔍 Verifying LoveCDN stream URL: {stream_url}")
+                                try:
+                                    # Use a short timeout for validation
+                                    validation_timeout = ClientTimeout(total=5)
+                                    async with session.get(stream_url, headers=stream_headers, ssl=False, timeout=validation_timeout) as stream_resp:
+                                        if stream_resp.status == 200:
+                                            # Read a small chunk to verify it's a playlist
+                                            content_check = await stream_resp.read()
+                                            content_str = content_check.decode('utf-8', errors='ignore')
+                                            
+                                            if "#EXTM3U" in content_str:
+                                                logger.info(f"✅ LoveCDN stream URL verified (200 OK + Valid M3U8).")
+                                                result["_source"] = "lovecdn"
+                                                # Clear any failure record
+                                                self._lovecdn_failure_time.pop(channel_id, None)
+                                                self._stream_data_cache[channel_id] = result
+                                                self._save_cache()
+                                                return result
+                                            else:
+                                                logger.warning(f"⚠️ LoveCDN stream URL returned 200 but content doesn't look like M3U8. Content start: {content_str[:50]}")
+                                                self._lovecdn_failure_time[channel_id] = time.time()
+                                        else:
+                                            logger.warning(f"⚠️ LoveCDN stream URL verification failed. Status: {stream_resp.status}")
+                                            self._lovecdn_failure_time[channel_id] = time.time()
+                                except Exception as e:
+                                    logger.warning(f"⚠️ LoveCDN stream URL verification failed with error: {e}")
+                                    self._lovecdn_failure_time[channel_id] = time.time()
                             else:
                                 logger.warning(f"⚠️ LoveCDN URL returned status {resp.status}. Falling back to standard hosts.")
+                                self._lovecdn_failure_time[channel_id] = time.time()
                     except Exception as e:
                         logger.error(f"❌ Failed to extract from worker-provided LoveCDN URL: {e}. Falling back to standard hosts.")
+                        self._lovecdn_failure_time[channel_id] = time.time()
                 
                 # Se lovecdn non c'è o fallisce, procedi con metodo standard
                 try:
@@ -637,6 +681,7 @@ class DLHDExtractor:
                         raise
                 
                 # Salva in cache
+                result["_source"] = "standard"
                 self._stream_data_cache[channel_id] = result
                 self._save_cache()
                 
