@@ -56,18 +56,25 @@ class DoodStreamExtractor:
         self, url: str
     ) -> tuple[str | None, str | None, str | None, str, str]:
         last_result = (None, None, None, url, "")
+        browser_proxy = self._get_random_proxy()
 
         for attempt in range(1, 4):
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=[
+                launch_options = {
+                    "headless": True,
+                    "args": [
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
                         "--autoplay-policy=no-user-gesture-required",
                         "--disable-dev-shm-usage",
                     ],
-                )
+                }
+                if browser_proxy:
+                    launch_options["proxy"] = {"server": browser_proxy}
+                    if attempt == 1:
+                        logger.info("DoodStream browser fallback using proxy: %s", browser_proxy)
+
+                browser = await playwright.chromium.launch(**launch_options)
                 context = await browser.new_context(
                     user_agent=self.base_headers["user-agent"],
                     locale="en-US",
