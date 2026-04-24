@@ -72,9 +72,12 @@ if [ "$ENABLE_WARP" = "true" ]; then
 fi
 
 PROXY_VARS=""
-if [ "$ENABLE_WARP" = "true" ]; then
+SOLVERS_FORCE_WARP_PROXY="${SOLVERS_FORCE_WARP_PROXY:-false}"
+if [ "$ENABLE_WARP" = "true" ] && [ "$SOLVERS_FORCE_WARP_PROXY" = "true" ]; then
     PROXY_VARS="HTTP_PROXY=socks5://127.0.0.1:1080 HTTPS_PROXY=socks5://127.0.0.1:1080 NO_PROXY=localhost,127.0.0.1"
-    echo "FlareSolverr/Byparr will use WARP SOCKS5 proxy: socks5://127.0.0.1:1080"
+    echo "FlareSolverr/Byparr forced to use WARP SOCKS5 proxy globally: socks5://127.0.0.1:1080"
+else
+    echo "FlareSolverr/Byparr will use per-request routing from EasyProxy (supports real warp=off bypass)."
 fi
 
 echo "Starting FlareSolverr (v3 Python)..."

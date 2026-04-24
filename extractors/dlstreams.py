@@ -378,6 +378,7 @@ class DLStreamsExtractor:
             try:
                 playwright, browser, context = await self._launch_browser()
                 try:
+                    self._update_shared_activity()
                     page = await context.new_page()
 
                     async def handle_popup_capture(popup):
@@ -414,16 +415,19 @@ class DLStreamsExtractor:
 
                     context.on("response", on_response)
                     await page.goto(resolved_player_url, wait_until="load", timeout=30000)
+                    self._update_shared_activity()
                     
                     # Small interaction to trigger player/manifest generation
                     try:
                         await page.mouse.click(683, 384) # Click center of 1366x768
                         await page.wait_for_timeout(2000)
+                        self._update_shared_activity()
                     except:
                         pass
 
                     deadline = time.time() + 35
                     while time.time() < deadline:
+                        self._update_shared_activity()
                         has_key = any("/key/" in key for key in self._browser_key_cache)
                         if manifest_text and has_key:
                             break
@@ -434,7 +438,11 @@ class DLStreamsExtractor:
                         self._clear_browser_failure(channel_key)
                     else:
                         self._clear_channel_cache(channel_id)
-                        self._mark_browser_failure(channel_key)
+                        logger.debug(
+                            "DLStreams browser capture finished without manifest for %s via %s",
+                            channel_key,
+                            resolved_player_url,
+                        )
 
                     self._captured_cookies = await context.cookies()
                     
@@ -626,6 +634,7 @@ class DLStreamsExtractor:
                         break
             
             if not captured_manifest:
+                self._mark_browser_failure(channel_key)
                 raise ExtractorError("Could not retrieve manifest after browser refresh.")
             
             # Update micro-cache
